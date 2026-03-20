@@ -23,11 +23,61 @@ variables:
 stages:
 
 # ═══════════════════════════════════════════════════════════════════
+# STAGE 0 — PATCH MANIFESTS (fix registry + strip sha256 digests)
+# ═══════════════════════════════════════════════════════════════════
+- stage: PatchManifests
+  displayName: '🔧 Patch manifests → ACR + strip sha256'
+  jobs:
+
+  - job: PatchAndCommit
+    pool:
+      name: 'projectpool'
+
+    steps:
+    - checkout: self
+      persistCredentials: false
+      clean: true
+
+    - bash: |
+        git config user.email "$(GIT_EMAIL)"
+        git config user.name  "$(GIT_USERNAME)"
+
+        git remote set-url origin \
+          https://$(GIT_USERNAME):$(GIT_TOKEN)@github.com/muzzammil-hamdu/bank-of-anthos.git
+
+        echo "=== Replacing Google registry with acrdev12345.azurecr.io ==="
+        find kubernetes-manifests/ -name "*.yaml" -exec \
+          sed -i \
+            -e "s|gcr.io/bank-of-anthos-ci/bank-of-anthos|acrdev12345.azurecr.io/bank-of-anthos|g" \
+            -e "s|us-central1-docker.pkg.dev/bank-of-anthos-ci/bank-of-anthos-serverless|acrdev12345.azurecr.io/bank-of-anthos|g" \
+          {} \;
+
+        echo "=== Stripping @sha256 digests ==="
+        find kubernetes-manifests/ -name "*.yaml" -exec \
+          sed -i -E "s|@sha256:[a-f0-9]+||g" {} \;
+
+        echo "=== Diff ==="
+        git diff --stat
+
+        if git diff --quiet; then
+          echo "Already patched — no changes needed."
+        else
+          git add kubernetes-manifests/
+          git commit -m "fix: patch registry to acrdev12345 and strip sha256 digests [skip ci]"
+          git push origin HEAD:main
+          echo "Pushed — ArgoCD will sync patched manifests."
+        fi
+      displayName: 'Patch registry refs & strip sha256'
+
+
+# ═══════════════════════════════════════════════════════════════════
 # STAGE 1a — BUILD Python/Docker services (frontend, userservice,
 #             contacts, loadgenerator) — have real Dockerfiles
 # ═══════════════════════════════════════════════════════════════════
 - stage: Build
   displayName: '🐳 Build & Push All Images → acrdev12345'
+  dependsOn: PatchManifests
+  condition: succeeded()
   jobs:
 
   - job: BuildDockerServices
