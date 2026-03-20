@@ -56,6 +56,20 @@ stages:
         find kubernetes-manifests/ -name "*.yaml" -exec \
           sed -i -E "s|@sha256:[a-f0-9]+||g" {} \;
 
+        echo "=== Disabling GCP Stackdriver tracing (not available on Azure) ==="
+        # Disable tracing & GCP metrics in all Java service manifests
+        for svc in ledgerwriter balancereader transactionhistory; do
+          if [ -f "kubernetes-manifests/${svc}.yaml" ]; then
+            sed -i \
+              '/name: ENABLE_TRACING/{n; s/value: "true"/value: "false"/}' \
+              kubernetes-manifests/${svc}.yaml
+            sed -i \
+              '/name: ENABLE_METRICS/{n; s/value: "true"/value: "false"/}' \
+              kubernetes-manifests/${svc}.yaml
+            echo "  Patched tracing/metrics off for ${svc}"
+          fi
+        done
+
         echo "=== Diff ==="
         git diff --stat
 
@@ -224,6 +238,19 @@ stages:
             --username $(GIT_USERNAME) \
             --password $(GIT_TOKEN) \
             --upsert
+
+          # ── Scale AKS node pool to 2 nodes (bank-of-anthos needs ~15 pods) ──
+          echo "=== Scaling aks-dev node pool to 2 nodes ==="
+          az aks nodepool scale \
+            --resource-group aks-dev-rg-west \
+            --cluster-name aks-dev \
+            --name nodepool1 \
+            --node-count 2
+          echo "✅ Node pool scaled to 2."
+
+          # ── StorageClass for AKS (accounts-db & ledger-db PVCs) ────
+          kubectl apply -f storageclass.yaml
+          echo "✅ StorageClass applied."
 
           # ── Create namespace ────────────────────────────────────
           kubectl create namespace bank-of-anthos --dry-run=client -o yaml | kubectl apply -f -
@@ -398,6 +425,17 @@ stages:
           echo ""
           echo "=== Pod status ==="
           kubectl get pods -n bank-of-anthos
+
+          echo ""
+          echo "=== PVC status ==="
+          kubectl get pvc -n bank-of-anthos
+
+          echo ""
+          echo "=== Degraded pod details ==="
+          for pod in $(kubectl get pods -n bank-of-anthos --no-headers | grep -v Running | awk '{print $1}'); do
+            echo "--- $pod ---"
+            kubectl describe pod $pod -n bank-of-anthos | grep -A5 "Events:"
+          done
 
           echo ""
           echo "=== 🌐 App URL ==="
