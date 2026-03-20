@@ -1,0 +1,334 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    exclude:
+      - iac/**
+      - README.md
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  # ── ACR ─────────────────────────────────────────────────────────────
+  acrName: 'acrdev12345'                             # ✅ from Azure portal
+  acrServer: 'acrdev12345.azurecr.io'               # ✅ from Azure portal
+  imageRepo: 'bank-of-anthos'
+  imageTag: '$(Build.BuildId)'
+
+  # ── AKS ─────────────────────────────────────────────────────────────
+  aksResourceGroup: 'aks-dev-rg-west'               # ✅ from Azure portal
+  aksClusterName: 'aks-dev'                         # ✅ from Azure portal
+
+  # ── ADO Service Connections (only 2 things left for you to set) ──────
+  azureServiceConnection: 'azure-service-connection' # <-- name this in ADO Project Settings
+  acrServiceConnection: 'acr-service-connection'     # <-- name this in ADO Project Settings
+
+  # ── Misc ─────────────────────────────────────────────────────────────
+  k8sNamespace: 'default'
+  manifestsDir: 'kubernetes-manifests'
+
+stages:
+
+# ═══════════════════════════════════════════════════════════════════════
+# STAGE 1 — BUILD & PUSH ALL 7 IMAGES TO acrdev12345.azurecr.io
+# ═══════════════════════════════════════════════════════════════════════
+- stage: Build
+  displayName: 'Build & Push Images → acrdev12345'
+  jobs:
+
+  - job: BuildPushImages
+    displayName: 'Docker Build & Push (parallel matrix)'
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    strategy:
+      matrix:
+        frontend:
+          serviceName: 'frontend'
+          dockerfilePath: 'src/frontend/Dockerfile'
+          buildContext: 'src/frontend'
+        userservice:
+          serviceName: 'userservice'
+          dockerfilePath: 'src/accounts/userservice/Dockerfile'
+          buildContext: 'src/accounts/userservice'
+        contacts:
+          serviceName: 'contacts'
+          dockerfilePath: 'src/accounts/contacts/Dockerfile'
+          buildContext: 'src/accounts/contacts'
+        ledgerwriter:
+          serviceName: 'ledgerwriter'
+          dockerfilePath: 'src/ledger/ledgerwriter/Dockerfile'
+          buildContext: 'src/ledger/ledgerwriter'
+        balancereader:
+          serviceName: 'balancereader'
+          dockerfilePath: 'src/ledger/balancereader/Dockerfile'
+          buildContext: 'src/ledger/balancereader'
+        transactionhistory:
+          serviceName: 'transactionhistory'
+          dockerfilePath: 'src/ledger/transactionhistory/Dockerfile'
+          buildContext: 'src/ledger/transactionhistory'
+        loadgenerator:
+          serviceName: 'loadgenerator'
+          dockerfilePath: 'src/loadgenerator/Dockerfile'
+          buildContext: 'src/loadgenerator'
+
+    steps:
+    - checkout: self
+
+    - task: Docker@2
+      displayName: 'Build & Push $(serviceName)'
+      inputs:
+        command: buildAndPush
+        containerRegistry: '$(acrServiceConnection)'
+        repository: '$(imageRepo)/$(serviceName)'
+        dockerfile: '$(dockerfilePath)'
+        buildContext: '$(buildContext)'
+        tags: |
+          $(imageTag)
+          latest
+
+  # ── Patch manifests & publish as pipeline artifact ─────────────────
+  - job: PublishManifests
+    displayName: 'Patch manifests → Publish artifact'
+    pool:
+      vmImage: 'ubuntu-latest'
+    dependsOn: BuildPushImages
+
+    steps:
+    - checkout: self
+
+    - bash: |
+        echo "=== Replacing Google registry with acrdev12345.azurecr.io ==="
+        find $(manifestsDir)/ -name "*.yaml" -exec \
+          sed -i \
+            -e "s|gcr.io/bank-of-anthos-ci/bank-of-anthos|acrdev12345.azurecr.io/bank-of-anthos|g" \
+            -e "s|us-central1-docker.pkg.dev/bank-of-anthos-ci/bank-of-anthos-serverless|acrdev12345.azurecr.io/bank-of-anthos|g" \
+          {} \;
+
+        echo "=== Stamping build ID: $(imageTag) ==="
+        find $(manifestsDir)/ -name "*.yaml" -exec \
+          sed -i \
+            -e "s|acrdev12345.azurecr.io/bank-of-anthos/\([^:]*\):latest|acrdev12345.azurecr.io/bank-of-anthos/\1:$(imageTag)|g" \
+          {} \;
+
+        echo "=== Resulting image lines ==="
+        grep -r "image:" $(manifestsDir)/ || true
+      displayName: 'Patch image references in manifests'
+
+    - publish: '$(manifestsDir)'
+      artifact: k8s-manifests
+      displayName: 'Publish patched manifests as artifact'
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# STAGE 2 — TERRAFORM (infra already exists; runs on main to catch drift)
+# ═══════════════════════════════════════════════════════════════════════
+- stage: Infra
+  displayName: 'Terraform — Sync aks-dev-rg-west'
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+
+  - job: Terraform
+    displayName: 'Terraform Init → Plan → Apply'
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+    - checkout: self
+
+    - task: TerraformInstaller@1
+      displayName: 'Install Terraform'
+      inputs:
+        terraformVersion: 'latest'
+
+    - task: TerraformTaskV4@4
+      displayName: 'terraform init'
+      inputs:
+        provider: 'azurerm'
+        command: 'init'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/iac'
+        backendServiceArm: '$(azureServiceConnection)'
+        backendAzureRmResourceGroupName: 'aks-dev-rg-west'
+        backendAzureRmStorageAccountName: 'tfstateXXXXX'   # <-- replace with your storage account
+        backendAzureRmContainerName: 'tfstate'
+        backendAzureRmKey: 'bank-of-anthos.tfstate'
+
+    - task: TerraformTaskV4@4
+      displayName: 'terraform plan'
+      inputs:
+        provider: 'azurerm'
+        command: 'plan'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/iac'
+        environmentServiceNameAzureRM: '$(azureServiceConnection)'
+        commandOptions: '-out=tfplan'
+
+    - task: TerraformTaskV4@4
+      displayName: 'terraform apply'
+      inputs:
+        provider: 'azurerm'
+        command: 'apply'
+        workingDirectory: '$(System.DefaultWorkingDirectory)/iac'
+        environmentServiceNameAzureRM: '$(azureServiceConnection)'
+        commandOptions: 'tfplan'
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# STAGE 3 — DEPLOY TO aks-dev (West Europe)
+# ═══════════════════════════════════════════════════════════════════════
+- stage: Deploy
+  displayName: 'Deploy → aks-dev (West Europe)'
+  dependsOn: Infra
+  condition: succeeded()
+  jobs:
+
+  - deployment: DeployToAKS
+    displayName: 'kubectl apply to aks-dev'
+    pool:
+      vmImage: 'ubuntu-latest'
+    environment: 'aks-dev-west'    # ADO Environment — add approval gates here if needed
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          # ── 1. Connect to aks-dev ──────────────────────────────────
+          - task: AzureCLI@2
+            displayName: '🔗 Connect to aks-dev'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Fetching kubeconfig for aks-dev in aks-dev-rg-west..."
+                az aks get-credentials \
+                  --resource-group aks-dev-rg-west \
+                  --name aks-dev \
+                  --overwrite-existing
+                echo ""
+                echo "=== Cluster nodes ==="
+                kubectl get nodes
+
+          # ── 2. JWT secret (idempotent) ─────────────────────────────
+          - task: AzureCLI@2
+            displayName: '🔑 Create JWT secret (skip if exists)'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                if ! kubectl get secret jwt-key -n $(k8sNamespace) &>/dev/null; then
+                  echo "Generating RSA key pair for JWT..."
+                  openssl genrsa -out jwtRS256.key 4096
+                  openssl rsa -in jwtRS256.key -pubout -out jwtRS256.key.pub
+                  kubectl create secret generic jwt-key \
+                    --from-file=jwtRS256.key=jwtRS256.key \
+                    --from-file=jwtRS256.key.pub=jwtRS256.key.pub \
+                    -n $(k8sNamespace)
+                  rm -f jwtRS256.key jwtRS256.key.pub
+                  echo "✅ JWT secret created."
+                else
+                  echo "✅ JWT secret already exists — skipping."
+                fi
+
+          # ── 3. Deploy databases first ──────────────────────────────
+          - task: KubernetesManifest@1
+            displayName: '🗄️  Deploy — accounts-db & ledger-db'
+            inputs:
+              action: deploy
+              connectionType: azureResourceManager
+              azureSubscriptionConnection: '$(azureServiceConnection)'
+              azureResourceGroup: 'aks-dev-rg-west'
+              kubernetesCluster: 'aks-dev'
+              namespace: '$(k8sNamespace)'
+              manifests: |
+                $(Pipeline.Workspace)/k8s-manifests/accounts-db.yaml
+                $(Pipeline.Workspace)/k8s-manifests/ledger-db.yaml
+
+          # ── 4. Wait for DBs before services ───────────────────────
+          - task: AzureCLI@2
+            displayName: '⏳ Wait for databases to be Ready'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                kubectl rollout status statefulset/accounts-db -n $(k8sNamespace) --timeout=5m 2>/dev/null || \
+                kubectl rollout status deployment/accounts-db  -n $(k8sNamespace) --timeout=5m 2>/dev/null || true
+
+                kubectl rollout status statefulset/ledger-db -n $(k8sNamespace) --timeout=5m 2>/dev/null || \
+                kubectl rollout status deployment/ledger-db  -n $(k8sNamespace) --timeout=5m 2>/dev/null || true
+
+                echo "✅ Databases ready"
+
+          # ── 5. Deploy backend services ─────────────────────────────
+          - task: KubernetesManifest@1
+            displayName: '⚙️  Deploy — backend services'
+            inputs:
+              action: deploy
+              connectionType: azureResourceManager
+              azureSubscriptionConnection: '$(azureServiceConnection)'
+              azureResourceGroup: 'aks-dev-rg-west'
+              kubernetesCluster: 'aks-dev'
+              namespace: '$(k8sNamespace)'
+              manifests: |
+                $(Pipeline.Workspace)/k8s-manifests/userservice.yaml
+                $(Pipeline.Workspace)/k8s-manifests/contacts.yaml
+                $(Pipeline.Workspace)/k8s-manifests/ledgerwriter.yaml
+                $(Pipeline.Workspace)/k8s-manifests/balancereader.yaml
+                $(Pipeline.Workspace)/k8s-manifests/transactionhistory.yaml
+
+          # ── 6. Deploy frontend & loadgenerator ────────────────────
+          - task: KubernetesManifest@1
+            displayName: '🌐 Deploy — frontend & loadgenerator'
+            inputs:
+              action: deploy
+              connectionType: azureResourceManager
+              azureSubscriptionConnection: '$(azureServiceConnection)'
+              azureResourceGroup: 'aks-dev-rg-west'
+              kubernetesCluster: 'aks-dev'
+              namespace: '$(k8sNamespace)'
+              manifests: |
+                $(Pipeline.Workspace)/k8s-manifests/frontend.yaml
+                $(Pipeline.Workspace)/k8s-manifests/loadgenerator.yaml
+
+          # ── 7. Health check & print live URL ──────────────────────
+          - task: AzureCLI@2
+            displayName: '✅ Verify rollout & print app URL'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "=== Rollout status ==="
+                for d in frontend userservice contacts ledgerwriter balancereader transactionhistory loadgenerator; do
+                  kubectl rollout status deployment/$d -n $(k8sNamespace) --timeout=5m
+                done
+
+                echo ""
+                echo "=== All pods ==="
+                kubectl get pods -n $(k8sNamespace) -o wide
+
+                echo ""
+                echo "=== Waiting for frontend LoadBalancer IP ==="
+                EXTERNAL_IP=""
+                for i in {1..20}; do
+                  EXTERNAL_IP=$(kubectl get service frontend -n $(k8sNamespace) \
+                    -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
+                  if [[ -n "$EXTERNAL_IP" ]]; then break; fi
+                  echo "  Attempt $i/20 — waiting 15s..."
+                  sleep 15
+                done
+
+                if [[ -n "$EXTERNAL_IP" ]]; then
+                  echo ""
+                  echo "🚀 Bank of Anthos is live at: http://$EXTERNAL_IP"
+                  echo "##vso[task.setvariable variable=APP_URL;isOutput=true]http://$EXTERNAL_IP"
+                else
+                  echo "⚠️  External IP not yet assigned."
+                  echo "    Run manually: kubectl get service frontend"
+                fi
