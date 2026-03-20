@@ -1,0 +1,44 @@
+---
+# ServiceMonitor — tells Prometheus to scrape Bank of Anthos pods
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: bank-of-anthos
+  namespace: bank-of-anthos
+  labels:
+    release: kube-prometheus-stack    # must match your Helm release name
+    app: bank-of-anthos
+spec:
+  namespaceSelector:
+    matchNames:
+      - bank-of-anthos
+  selector:
+    matchLabels:
+      app: bank-of-anthos            # matches services in kubernetes-manifests/
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+
+---
+# PodMonitor — scrapes pods directly (fallback if services lack /metrics)
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: bank-of-anthos-pods
+  namespace: bank-of-anthos
+  labels:
+    release: kube-prometheus-stack
+    app: bank-of-anthos
+spec:
+  namespaceSelector:
+    matchNames:
+      - bank-of-anthos
+  selector:
+    matchLabels:
+      app: bank-of-anthos
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 30s

@@ -1,0 +1,178 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: bank-of-anthos-alerts
+  namespace: bank-of-anthos
+  labels:
+    # These labels must match your kube-prometheus-stack's ruleSelector
+    # Default for kube-prometheus-stack is release: <helm-release-name>
+    release: kube-prometheus-stack
+    app: bank-of-anthos
+spec:
+  groups:
+
+  # ── Pod Health ──────────────────────────────────────────────────────
+  - name: bank-of-anthos.pods
+    rules:
+
+    - alert: BankOfAnthosPodCrashLooping
+      expr: |
+        rate(kube_pod_container_status_restarts_total{
+          namespace="bank-of-anthos"
+        }[5m]) * 60 > 0
+      for: 5m
+      labels:
+        severity: critical
+        app: bank-of-anthos
+      annotations:
+        summary: "Pod {{ $labels.pod }} is crash looping"
+        description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} has restarted {{ $value | printf \"%.2f\" }} times/min for 5 minutes."
+
+    - alert: BankOfAnthosPodNotReady
+      expr: |
+        kube_pod_status_ready{
+          namespace="bank-of-anthos",
+          condition="true"
+        } == 0
+      for: 5m
+      labels:
+        severity: warning
+        app: bank-of-anthos
+      annotations:
+        summary: "Pod {{ $labels.pod }} is not ready"
+        description: "Pod {{ $labels.pod }} in bank-of-anthos has been not ready for 5 minutes."
+
+    - alert: BankOfAnthosPodPending
+      expr: |
+        kube_pod_status_phase{
+          namespace="bank-of-anthos",
+          phase="Pending"
+        } == 1
+      for: 10m
+      labels:
+        severity: warning
+        app: bank-of-anthos
+      annotations:
+        summary: "Pod {{ $labels.pod }} stuck in Pending"
+        description: "Pod {{ $labels.pod }} has been Pending for over 10 minutes. Possible image pull or scheduling issue."
+
+  # ── CPU & Memory ────────────────────────────────────────────────────
+  - name: bank-of-anthos.resources
+    rules:
+
+    - alert: BankOfAnthosHighCPU
+      expr: |
+        sum(rate(container_cpu_usage_seconds_total{
+          namespace="bank-of-anthos",
+          container!=""
+        }[5m])) by (pod, container)
+        /
+        sum(kube_pod_container_resource_limits{
+          namespace="bank-of-anthos",
+          resource="cpu"
+        }) by (pod, container)
+        > 0.85
+      for: 5m
+      labels:
+        severity: warning
+        app: bank-of-anthos
+      annotations:
+        summary: "High CPU on {{ $labels.pod }}/{{ $labels.container }}"
+        description: "Container {{ $labels.container }} in pod {{ $labels.pod }} is using {{ $value | humanizePercentage }} of its CPU limit."
+
+    - alert: BankOfAnthosHighMemory
+      expr: |
+        sum(container_memory_working_set_bytes{
+          namespace="bank-of-anthos",
+          container!=""
+        }) by (pod, container)
+        /
+        sum(kube_pod_container_resource_limits{
+          namespace="bank-of-anthos",
+          resource="memory"
+        }) by (pod, container)
+        > 0.85
+      for: 5m
+      labels:
+        severity: warning
+        app: bank-of-anthos
+      annotations:
+        summary: "High memory on {{ $labels.pod }}/{{ $labels.container }}"
+        description: "Container {{ $labels.container }} in pod {{ $labels.pod }} is using {{ $value | humanizePercentage }} of its memory limit."
+
+    - alert: BankOfAnthosOOMKilled
+      expr: |
+        kube_pod_container_status_last_terminated_reason{
+          namespace="bank-of-anthos",
+          reason="OOMKilled"
+        } == 1
+      for: 0m
+      labels:
+        severity: critical
+        app: bank-of-anthos
+      annotations:
+        summary: "OOMKilled: {{ $labels.pod }}/{{ $labels.container }}"
+        description: "Container {{ $labels.container }} in pod {{ $labels.pod }} was OOMKilled. Increase memory limits."
+
+  # ── Service / Frontend ──────────────────────────────────────────────
+  - name: bank-of-anthos.frontend
+    rules:
+
+    - alert: BankOfAnthosFrontendDown
+      expr: |
+        kube_deployment_status_replicas_available{
+          namespace="bank-of-anthos",
+          deployment="frontend"
+        } == 0
+      for: 2m
+      labels:
+        severity: critical
+        app: bank-of-anthos
+      annotations:
+        summary: "Bank of Anthos frontend is DOWN"
+        description: "The frontend deployment has 0 available replicas for 2 minutes. App is unreachable."
+
+    - alert: BankOfAnthosDeploymentUnavailable
+      expr: |
+        kube_deployment_status_replicas_unavailable{
+          namespace="bank-of-anthos"
+        } > 0
+      for: 5m
+      labels:
+        severity: warning
+        app: bank-of-anthos
+      annotations:
+        summary: "Deployment {{ $labels.deployment }} has unavailable replicas"
+        description: "{{ $value }} replica(s) of {{ $labels.deployment }} have been unavailable for 5 minutes."
+
+  # ── ArgoCD Sync ─────────────────────────────────────────────────────
+  - name: bank-of-anthos.argocd
+    rules:
+
+    - alert: BankOfAnthosArgoCDSyncFailed
+      expr: |
+        argocd_app_info{
+          name="bank-of-anthos",
+          sync_status!="Synced"
+        } == 1
+      for: 10m
+      labels:
+        severity: warning
+        app: bank-of-anthos
+      annotations:
+        summary: "ArgoCD app bank-of-anthos is out of sync"
+        description: "bank-of-anthos has been in sync_status={{ $labels.sync_status }} for 10 minutes. Check ArgoCD UI."
+
+    - alert: BankOfAnthosArgoCDUnhealthy
+      expr: |
+        argocd_app_info{
+          name="bank-of-anthos",
+          health_status!="Healthy"
+        } == 1
+      for: 10m
+      labels:
+        severity: critical
+        app: bank-of-anthos
+      annotations:
+        summary: "ArgoCD app bank-of-anthos is unhealthy"
+        description: "bank-of-anthos health_status={{ $labels.health_status }} for 10 minutes."

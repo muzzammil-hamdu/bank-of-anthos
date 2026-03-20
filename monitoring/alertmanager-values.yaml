@@ -1,0 +1,112 @@
+# ============================================================
+# AlertManager additional config for Bank of Anthos
+#
+# HOW TO APPLY:
+# If using kube-prometheus-stack, patch your Helm values with
+# the alertmanager.config block below, then helm upgrade.
+#
+# helm upgrade kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+#   -n monitoring -f alertmanager-values.yaml
+# ============================================================
+
+alertmanager:
+  config:
+    global:
+      resolve_timeout: 5m
+
+    # ── Routing tree ─────────────────────────────────────────
+    route:
+      group_by: ['alertname', 'app', 'severity']
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      receiver: 'default'
+
+      routes:
+        # Critical alerts → immediate notification
+        - matchers:
+            - app = bank-of-anthos
+            - severity = critical
+          receiver: bank-of-anthos-critical
+          group_wait: 10s
+          repeat_interval: 1h
+
+        # Warning alerts → standard notification
+        - matchers:
+            - app = bank-of-anthos
+            - severity = warning
+          receiver: bank-of-anthos-warning
+          repeat_interval: 4h
+
+        # ArgoCD alerts
+        - matchers:
+            - app = bank-of-anthos
+            - alertname =~ "BankOfAnthosArgoCD.*"
+          receiver: bank-of-anthos-argocd
+          repeat_interval: 2h
+
+    # ── Receivers ────────────────────────────────────────────
+    receivers:
+
+      - name: 'default'
+        # fallback — replace with your default receiver
+
+      - name: bank-of-anthos-critical
+        # Option A: Email
+        email_configs:
+          - to: 'shaikhussain752@gmail.com'     # ✅ from your mysecrets GIT_EMAIL
+            from: 'alertmanager@aks-dev.local'
+            smarthost: 'smtp.gmail.com:587'
+            auth_username: 'shaikhussain752@gmail.com'
+            auth_password: '<your-smtp-app-password>'  # <-- add to mysecrets as SMTP_PASSWORD
+            send_resolved: true
+            headers:
+              Subject: '🔴 [CRITICAL] Bank of Anthos: {{ .GroupLabels.alertname }}'
+            html: |
+              <h2>🔴 Critical Alert — Bank of Anthos</h2>
+              {{ range .Alerts }}
+              <b>Alert:</b> {{ .Annotations.summary }}<br>
+              <b>Details:</b> {{ .Annotations.description }}<br>
+              <b>Started:</b> {{ .StartsAt }}<br><br>
+              {{ end }}
+
+        # Option B: Slack (uncomment to use instead/additionally)
+        # slack_configs:
+        #   - api_url: '<your-slack-webhook-url>'
+        #     channel: '#bank-of-anthos-alerts'
+        #     send_resolved: true
+        #     title: '🔴 CRITICAL: {{ .GroupLabels.alertname }}'
+        #     text: '{{ range .Alerts }}{{ .Annotations.description }}{{ end }}'
+
+      - name: bank-of-anthos-warning
+        email_configs:
+          - to: 'shaikhussain752@gmail.com'
+            from: 'alertmanager@aks-dev.local'
+            smarthost: 'smtp.gmail.com:587'
+            auth_username: 'shaikhussain752@gmail.com'
+            auth_password: '<your-smtp-app-password>'
+            send_resolved: true
+            headers:
+              Subject: '🟡 [WARNING] Bank of Anthos: {{ .GroupLabels.alertname }}'
+
+      - name: bank-of-anthos-argocd
+        email_configs:
+          - to: 'shaikhussain752@gmail.com'
+            from: 'alertmanager@aks-dev.local'
+            smarthost: 'smtp.gmail.com:587'
+            auth_username: 'shaikhussain752@gmail.com'
+            auth_password: '<your-smtp-app-password>'
+            send_resolved: true
+            headers:
+              Subject: '⚠️ [ARGOCD] Bank of Anthos sync issue'
+
+    # ── Inhibition rules ─────────────────────────────────────
+    inhibit_rules:
+      # If frontend is completely down (critical), suppress warning-level alerts
+      - source_matchers:
+          - alertname = BankOfAnthosFrontendDown
+          - severity = critical
+        target_matchers:
+          - app = bank-of-anthos
+          - severity = warning
+        equal: ['app']

@@ -1,17 +1,4 @@
-trigger:
-  branches:
-    include:
-      - main
-  paths:
-    exclude:
-      - iac/**
-      - argocd/**
-      - README.md
-
-pr:
-  branches:
-    include:
-      - main
+trigger: none
 
 variables:
   - group: mysecrets   # GIT_EMAIL, GIT_TOKEN, GIT_USERNAME
@@ -93,7 +80,7 @@ stages:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# STAGE 2 — BOOTSTRAP ARGOCD (idempotent — safe on every run)
+# STAGE 2 — BOOTSTRAP ARGOCD (idempotent)
 # ═══════════════════════════════════════════════════════════════════
 - stage: BootstrapArgoCD
   displayName: '⚙️  Bootstrap ArgoCD App'
@@ -120,12 +107,10 @@ stages:
             --name aks-dev \
             --overwrite-existing
 
-          # Install argocd CLI
           curl -sSL -o /usr/local/bin/argocd \
             https://github.com/argoproj/argo-cd/releases/download/v2.11.3/argocd-linux-amd64
           chmod +x /usr/local/bin/argocd
 
-          # Get ArgoCD server IP & password
           ARGOCD_IP=$(kubectl get svc argocd-server -n argocd \
             -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
           ARGOCD_PASS=$(kubectl get secret argocd-initial-admin-secret \
@@ -136,26 +121,74 @@ stages:
             --password "$ARGOCD_PASS" \
             --insecure
 
-          # Add repo using GIT_TOKEN from mysecrets (idempotent via --upsert)
           echo "=== Registering GitHub repo with ArgoCD ==="
           argocd repo add https://github.com/muzzammil-hamdu/bank-of-anthos.git \
             --username $(GIT_USERNAME) \
             --password $(GIT_TOKEN) \
             --upsert
 
-          # Apply ArgoCD Application manifest (idempotent)
           echo "=== Applying ArgoCD Application ==="
           kubectl apply -f argocd/bank-of-anthos-app.yaml
-
           echo "✅ ArgoCD app registered."
 
 
 # ═══════════════════════════════════════════════════════════════════
-# STAGE 3 — COMMIT UPDATED IMAGE TAGS → ArgoCD auto-syncs
+# STAGE 3 — APPLY MONITORING (idempotent)
+# ═══════════════════════════════════════════════════════════════════
+- stage: ApplyMonitoring
+  displayName: '📊 Apply Prometheus Rules, ServiceMonitor & Grafana Dashboard'
+  dependsOn: BootstrapArgoCD
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+
+  - job: ApplyMonitoring
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+    - checkout: self
+
+    - task: AzureCLI@2
+      displayName: 'Apply monitoring manifests to aks-dev'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az aks get-credentials \
+            --resource-group aks-dev-rg-west \
+            --name aks-dev \
+            --overwrite-existing
+
+          # Ensure namespaces exist
+          kubectl create namespace bank-of-anthos --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create namespace monitoring      --dry-run=client -o yaml | kubectl apply -f -
+
+          echo "=== Applying PrometheusRule ==="
+          kubectl apply -f monitoring/prometheus-rules.yaml
+
+          echo "=== Applying ServiceMonitor & PodMonitor ==="
+          kubectl apply -f monitoring/service-monitor.yaml
+
+          echo "=== Applying Grafana Dashboard ConfigMap ==="
+          kubectl apply -f monitoring/grafana-dashboard.yaml
+
+          echo ""
+          echo "=== Verifying resources ==="
+          kubectl get prometheusrule -n bank-of-anthos
+          kubectl get servicemonitor  -n bank-of-anthos
+          kubectl get podmonitor      -n bank-of-anthos
+          kubectl get configmap bank-of-anthos-dashboard -n monitoring
+
+          echo "✅ Monitoring applied."
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STAGE 4 — COMMIT UPDATED IMAGE TAGS → ArgoCD auto-syncs
 # ═══════════════════════════════════════════════════════════════════
 - stage: UpdateManifests
   displayName: '📝 Commit image tags → trigger ArgoCD'
-  dependsOn: BootstrapArgoCD
+  dependsOn: ApplyMonitoring
   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
   jobs:
 
@@ -203,7 +236,7 @@ stages:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# STAGE 4 — WAIT FOR ARGOCD SYNC & PRINT APP URL
+# STAGE 5 — WAIT FOR ARGOCD SYNC & PRINT APP URL
 # ═══════════════════════════════════════════════════════════════════
 - stage: VerifySync
   displayName: '🔍 Wait for ArgoCD sync'
@@ -228,12 +261,10 @@ stages:
             --name aks-dev \
             --overwrite-existing
 
-          # Install argocd CLI
           curl -sSL -o /usr/local/bin/argocd \
             https://github.com/argoproj/argo-cd/releases/download/v2.11.3/argocd-linux-amd64
           chmod +x /usr/local/bin/argocd
 
-          # Get ArgoCD server IP & password
           ARGOCD_IP=$(kubectl get svc argocd-server -n argocd \
             -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
           ARGOCD_PASS=$(kubectl get secret argocd-initial-admin-secret \
