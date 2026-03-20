@@ -23,13 +23,15 @@ variables:
 stages:
 
 # ═══════════════════════════════════════════════════════════════════
-# STAGE 1 — BUILD & PUSH IMAGES
+# STAGE 1a — BUILD Python/Docker services (frontend, userservice,
+#             contacts, loadgenerator) — have real Dockerfiles
 # ═══════════════════════════════════════════════════════════════════
 - stage: Build
-  displayName: '🐳 Build & Push → acrdev12345'
+  displayName: '🐳 Build & Push All Images → acrdev12345'
   jobs:
 
-  - job: BuildPushImages
+  - job: BuildDockerServices
+    displayName: 'Docker Build — Python services'
     pool:
       vmImage: 'ubuntu-latest'
     strategy:
@@ -46,18 +48,6 @@ stages:
           serviceName: 'contacts'
           dockerfilePath: 'src/accounts/contacts/Dockerfile'
           buildContext: 'src/accounts/contacts'
-        ledgerwriter:
-          serviceName: 'ledgerwriter'
-          dockerfilePath: 'src/ledger/ledgerwriter/Dockerfile'
-          buildContext: 'src/ledger/ledgerwriter'
-        balancereader:
-          serviceName: 'balancereader'
-          dockerfilePath: 'src/ledger/balancereader/Dockerfile'
-          buildContext: 'src/ledger/balancereader'
-        transactionhistory:
-          serviceName: 'transactionhistory'
-          dockerfilePath: 'src/ledger/transactionhistory/Dockerfile'
-          buildContext: 'src/ledger/transactionhistory'
         loadgenerator:
           serviceName: 'loadgenerator'
           dockerfilePath: 'src/loadgenerator/Dockerfile'
@@ -78,6 +68,65 @@ stages:
           $(imageTag)
           latest
 
+  # ─────────────────────────────────────────────────────────────────
+  # Java ledger services use Maven Jib (no Dockerfile) — built here
+  # ─────────────────────────────────────────────────────────────────
+  - job: BuildJavaServices
+    displayName: 'Maven Jib Build — Java ledger services'
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+    - checkout: self
+
+    - task: JavaToolInstaller@0
+      displayName: 'Install Java 17'
+      inputs:
+        versionSpec: '17'
+        jdkArchitectureOption: 'x64'
+        jdkSourceOption: 'PreInstalled'
+
+    - task: AzureCLI@2
+      displayName: 'ACR Login for Jib'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az acr login --name acrdev12345
+
+    - bash: |
+        # Build & push ledgerwriter via Jib
+        cd src/ledger/ledgerwriter
+        mvn compile jib:build \
+          -Djib.to.image=acrdev12345.azurecr.io/bank-of-anthos/ledgerwriter:$(imageTag) \
+          -Djib.to.tags=latest \
+          -Djib.to.auth.username=$(az acr credential show --name acrdev12345 --query username -o tsv) \
+          -Djib.to.auth.password=$(az acr credential show --name acrdev12345 --query passwords[0].value -o tsv) \
+          --no-transfer-progress
+        cd ../../..
+
+        # Build & push balancereader via Jib
+        cd src/ledger/balancereader
+        mvn compile jib:build \
+          -Djib.to.image=acrdev12345.azurecr.io/bank-of-anthos/balancereader:$(imageTag) \
+          -Djib.to.tags=latest \
+          -Djib.to.auth.username=$(az acr credential show --name acrdev12345 --query username -o tsv) \
+          -Djib.to.auth.password=$(az acr credential show --name acrdev12345 --query passwords[0].value -o tsv) \
+          --no-transfer-progress
+        cd ../../..
+
+        # Build & push transactionhistory via Jib
+        cd src/ledger/transactionhistory
+        mvn compile jib:build \
+          -Djib.to.image=acrdev12345.azurecr.io/bank-of-anthos/transactionhistory:$(imageTag) \
+          -Djib.to.tags=latest \
+          -Djib.to.auth.username=$(az acr credential show --name acrdev12345 --query username -o tsv) \
+          -Djib.to.auth.password=$(az acr credential show --name acrdev12345 --query passwords[0].value -o tsv) \
+          --no-transfer-progress
+        cd ../../..
+      displayName: 'Jib build & push ledgerwriter, balancereader, transactionhistory'
+
 
 # ═══════════════════════════════════════════════════════════════════
 # STAGE 2 — BOOTSTRAP ARGOCD (idempotent)
@@ -85,7 +134,7 @@ stages:
 - stage: BootstrapArgoCD
   displayName: '⚙️  Bootstrap ArgoCD App'
   dependsOn: Build
-  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  condition: succeeded()
   jobs:
 
   - job: ApplyArgoCDApp
@@ -121,13 +170,11 @@ stages:
             --password "$ARGOCD_PASS" \
             --insecure
 
-          echo "=== Registering GitHub repo with ArgoCD ==="
           argocd repo add https://github.com/muzzammil-hamdu/bank-of-anthos.git \
             --username $(GIT_USERNAME) \
             --password $(GIT_TOKEN) \
             --upsert
 
-          echo "=== Applying ArgoCD Application ==="
           kubectl apply -f argocd/bank-of-anthos-app.yaml
           echo "✅ ArgoCD app registered."
 
@@ -136,9 +183,9 @@ stages:
 # STAGE 3 — APPLY MONITORING (idempotent)
 # ═══════════════════════════════════════════════════════════════════
 - stage: ApplyMonitoring
-  displayName: '📊 Apply Prometheus Rules, ServiceMonitor & Grafana Dashboard'
+  displayName: '📊 Apply Prometheus, ServiceMonitor & Grafana Dashboard'
   dependsOn: BootstrapArgoCD
-  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  condition: succeeded()
   jobs:
 
   - job: ApplyMonitoring
@@ -149,7 +196,7 @@ stages:
     - checkout: self
 
     - task: AzureCLI@2
-      displayName: 'Apply monitoring manifests to aks-dev'
+      displayName: 'Apply monitoring manifests'
       inputs:
         azureSubscription: '$(azureServiceConnection)'
         scriptType: 'bash'
@@ -160,25 +207,12 @@ stages:
             --name aks-dev \
             --overwrite-existing
 
-          # Ensure namespaces exist
           kubectl create namespace bank-of-anthos --dry-run=client -o yaml | kubectl apply -f -
           kubectl create namespace monitoring      --dry-run=client -o yaml | kubectl apply -f -
 
-          echo "=== Applying PrometheusRule ==="
           kubectl apply -f monitoring/prometheus-rules.yaml
-
-          echo "=== Applying ServiceMonitor & PodMonitor ==="
           kubectl apply -f monitoring/service-monitor.yaml
-
-          echo "=== Applying Grafana Dashboard ConfigMap ==="
           kubectl apply -f monitoring/grafana-dashboard.yaml
-
-          echo ""
-          echo "=== Verifying resources ==="
-          kubectl get prometheusrule -n bank-of-anthos
-          kubectl get servicemonitor  -n bank-of-anthos
-          kubectl get podmonitor      -n bank-of-anthos
-          kubectl get configmap bank-of-anthos-dashboard -n monitoring
 
           echo "✅ Monitoring applied."
 
@@ -189,7 +223,7 @@ stages:
 - stage: UpdateManifests
   displayName: '📝 Commit image tags → trigger ArgoCD'
   dependsOn: ApplyMonitoring
-  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  condition: succeeded()
   jobs:
 
   - job: PatchAndCommit
@@ -221,7 +255,6 @@ stages:
             "s|(acrdev12345\.azurecr\.io/bank-of-anthos/[^:]+):[^ ]+|\1:$(imageTag)|g" \
           {} \;
 
-        echo "=== Diff ==="
         git diff --stat
 
         if git diff --quiet; then
@@ -241,7 +274,7 @@ stages:
 - stage: VerifySync
   displayName: '🔍 Wait for ArgoCD sync'
   dependsOn: UpdateManifests
-  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  condition: succeeded()
   jobs:
 
   - job: WaitForSync
