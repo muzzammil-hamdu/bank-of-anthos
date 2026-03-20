@@ -1,5 +1,7 @@
-trigger: none
-
+trigger:
+  branches:
+    include:
+      - main
   paths:
     exclude:
       - iac/**
@@ -12,10 +14,8 @@ pr:
       - main
 
 variables:
-  # ── Pulled from your ADO variable group "mysecrets" ─────────────────
-  - group: mysecrets   # contains GIT_EMAIL, GIT_TOKEN, GIT_USERNAME
+  - group: mysecrets   # GIT_EMAIL, GIT_TOKEN, GIT_USERNAME
 
-  # ── Static vars ──────────────────────────────────────────────────────
   - name: acrName
     value: 'acrdev12345'
   - name: acrServer
@@ -29,7 +29,7 @@ variables:
   - name: aksClusterName
     value: 'aks-dev'
   - name: azureServiceConnection
-    value: 'azure-service-connection'   # <-- your ADO service connection name
+    value: 'azure-service-connection'
   - name: acrServiceConnection
     value: 'acr-service-connection-2'
 
@@ -93,11 +93,69 @@ stages:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# STAGE 2 — COMMIT UPDATED IMAGE TAGS → ArgoCD auto-syncs
+# STAGE 2 — BOOTSTRAP ARGOCD (idempotent — safe on every run)
+# ═══════════════════════════════════════════════════════════════════
+- stage: BootstrapArgoCD
+  displayName: '⚙️  Bootstrap ArgoCD App'
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+
+  - job: ApplyArgoCDApp
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+    - checkout: self
+
+    - task: AzureCLI@2
+      displayName: 'Add repo to ArgoCD & apply Application manifest'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az aks get-credentials \
+            --resource-group aks-dev-rg-west \
+            --name aks-dev \
+            --overwrite-existing
+
+          # Install argocd CLI
+          curl -sSL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/download/v2.11.3/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+
+          # Get ArgoCD server IP & password
+          ARGOCD_IP=$(kubectl get svc argocd-server -n argocd \
+            -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          ARGOCD_PASS=$(kubectl get secret argocd-initial-admin-secret \
+            -n argocd -o jsonpath='{.data.password}' | base64 -d)
+
+          argocd login "$ARGOCD_IP" \
+            --username admin \
+            --password "$ARGOCD_PASS" \
+            --insecure
+
+          # Add repo using GIT_TOKEN from mysecrets (idempotent via --upsert)
+          echo "=== Registering GitHub repo with ArgoCD ==="
+          argocd repo add https://github.com/muzzammil-hamdu/bank-of-anthos.git \
+            --username $(GIT_USERNAME) \
+            --password $(GIT_TOKEN) \
+            --upsert
+
+          # Apply ArgoCD Application manifest (idempotent)
+          echo "=== Applying ArgoCD Application ==="
+          kubectl apply -f argocd/bank-of-anthos-app.yaml
+
+          echo "✅ ArgoCD app registered."
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STAGE 3 — COMMIT UPDATED IMAGE TAGS → ArgoCD auto-syncs
 # ═══════════════════════════════════════════════════════════════════
 - stage: UpdateManifests
   displayName: '📝 Commit image tags → trigger ArgoCD'
-  dependsOn: Build
+  dependsOn: BootstrapArgoCD
   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
   jobs:
 
@@ -107,14 +165,13 @@ stages:
 
     steps:
     - checkout: self
-      persistCredentials: false   # we use GIT_TOKEN manually for auth
+      persistCredentials: false
       clean: true
 
     - bash: |
         git config user.email "$(GIT_EMAIL)"
         git config user.name  "$(GIT_USERNAME)"
 
-        # Authenticate using GIT_TOKEN from mysecrets variable group
         git remote set-url origin \
           https://$(GIT_USERNAME):$(GIT_TOKEN)@github.com/muzzammil-hamdu/bank-of-anthos.git
 
@@ -146,7 +203,7 @@ stages:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# STAGE 3 — WAIT FOR ARGOCD SYNC & PRINT APP URL
+# STAGE 4 — WAIT FOR ARGOCD SYNC & PRINT APP URL
 # ═══════════════════════════════════════════════════════════════════
 - stage: VerifySync
   displayName: '🔍 Wait for ArgoCD sync'
@@ -176,7 +233,7 @@ stages:
             https://github.com/argoproj/argo-cd/releases/download/v2.11.3/argocd-linux-amd64
           chmod +x /usr/local/bin/argocd
 
-          # Get ArgoCD server IP & admin password from cluster
+          # Get ArgoCD server IP & password
           ARGOCD_IP=$(kubectl get svc argocd-server -n argocd \
             -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
           ARGOCD_PASS=$(kubectl get secret argocd-initial-admin-secret \
