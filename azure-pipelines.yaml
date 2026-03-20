@@ -33,7 +33,7 @@ stages:
   - job: BuildDockerServices
     displayName: 'Docker Build — Python services'
     pool:
-      vmImage: 'ubuntu-latest'
+      name: 'projectpool'
     strategy:
       matrix:
         frontend:
@@ -74,7 +74,7 @@ stages:
   - job: BuildJavaServices
     displayName: 'Maven Jib Build — Java ledger services'
     pool:
-      vmImage: 'ubuntu-latest'
+      name: 'projectpool'
 
     steps:
     - checkout: self
@@ -139,7 +139,7 @@ stages:
 
   - job: ApplyArgoCDApp
     pool:
-      vmImage: 'ubuntu-latest'
+      name: 'projectpool'
 
     steps:
     - checkout: self
@@ -190,7 +190,7 @@ stages:
 
   - job: ApplyMonitoring
     pool:
-      vmImage: 'ubuntu-latest'
+      name: 'projectpool'
 
     steps:
     - checkout: self
@@ -228,7 +228,7 @@ stages:
 
   - job: PatchAndCommit
     pool:
-      vmImage: 'ubuntu-latest'
+      name: 'projectpool'
 
     steps:
     - checkout: self
@@ -279,7 +279,7 @@ stages:
 
   - job: WaitForSync
     pool:
-      vmImage: 'ubuntu-latest'
+      name: 'projectpool'
 
     steps:
     - task: AzureCLI@2
