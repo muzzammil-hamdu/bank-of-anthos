@@ -225,6 +225,37 @@ stages:
             --password $(GIT_TOKEN) \
             --upsert
 
+          # ── Create namespace ────────────────────────────────────
+          kubectl create namespace bank-of-anthos --dry-run=client -o yaml | kubectl apply -f -
+
+          # ── JWT secret (idempotent) ──────────────────────────────
+          if ! kubectl get secret jwt-key -n bank-of-anthos &>/dev/null; then
+            echo "=== Creating JWT secret ==="
+            openssl genrsa -out /tmp/jwtRS256.key 4096
+            openssl rsa -in /tmp/jwtRS256.key -pubout -out /tmp/jwtRS256.key.pub
+            kubectl create secret generic jwt-key \
+              --from-file=jwtRS256.key=/tmp/jwtRS256.key \
+              --from-file=jwtRS256.key.pub=/tmp/jwtRS256.key.pub \
+              -n bank-of-anthos
+            rm -f /tmp/jwtRS256.key /tmp/jwtRS256.key.pub
+            echo "✅ JWT secret created."
+          else
+            echo "✅ JWT secret already exists — skipping."
+          fi
+
+          # ── ACR image pull secret (idempotent) ──────────────────
+          ACR_USERNAME=$(az acr credential show --name acrdev12345 --query username -o tsv)
+          ACR_PASSWORD=$(az acr credential show --name acrdev12345 --query passwords[0].value -o tsv)
+
+          kubectl create secret docker-registry acr-secret \
+            --docker-server=acrdev12345.azurecr.io \
+            --docker-username=$ACR_USERNAME \
+            --docker-password=$ACR_PASSWORD \
+            --namespace=bank-of-anthos \
+            --dry-run=client -o yaml | kubectl apply -f -
+          echo "✅ ACR pull secret created/updated."
+
+          # ── Apply ArgoCD Application ─────────────────────────────
           kubectl apply -f argocd/bank-of-anthos-app.yaml
           echo "✅ ArgoCD app registered."
 
